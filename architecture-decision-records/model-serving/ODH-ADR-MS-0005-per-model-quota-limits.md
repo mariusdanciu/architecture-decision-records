@@ -196,9 +196,9 @@ The existing limitation documented in [quota-and-access-configuration.md](docs/c
 
 ## Open Questions
 
-1. **Metrics and observability**: Should the controller expose Prometheus metrics for model quota utilization (e.g., `maas_model_quota_usage_tokens_total`, `maas_model_quota_remaining_tokens`)? Limitador already exposes counters, but a MaaS-level metric may be easier to consume.
+1. **Metrics and observability**: Should the controller expose Prometheus metrics for model quota utilization (e.g., `maas_model_quota_usage_tokens_total`, `maas_model_quota_remaining_tokens`)? Limitador already exposes counters, but a MaaS-level metric may be easier to consume. Most likely this is not needed but worths calling it out.
 
-2. **ExternalModel support**: ExternalModels may have their own provider-side rate limits. Should the quota defined here apply only to the gateway layer, or should it also account for provider limits? Initial proposal: gateway-only, document that ExternalModel providers have their own limits.
+2. **ExternalModel support**: ExternalModels may have their own provider-side rate limits. At MaaS level we don't distinguish between external and internal model so the same rate limits apply. But for awareness the external provider may already configured other rate limits that we don't know about.
 
 ## Alternatives
 
