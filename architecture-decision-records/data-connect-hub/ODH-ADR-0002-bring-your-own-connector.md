@@ -116,7 +116,7 @@ Data Connect Hub has two client-facing entry points: the REST API (HTTP) and the
 
 **1. Connection-type to Flight service mapping**
 
-Each connection in the metadata store is associated with a connection type (e.g. `postgres`, `s3`, `my-custom-type`). The controller maintains a mapping from connector types to their Flight service endpoints. When the controller reconciles `customConnectors`, it updates a ConfigMap with the endpoint for each custom connector alongside the default Flight service endpoint. The default Flight service handles all built-in connector types; custom connectors handle only the types they register.
+Each connection in the metadata store is associated with a connection type (e.g. `postgres`, `s3`, `my-custom-type`). When a new flight service instance is created the controller sends the internal audit REST API `/audit/data-connection-types` and updates the `status.capabilities.flight` field of the DataConnectionType resource. This endpoint already exists. We can augment the capabilities object to also include the endpoint information. Therefore for a new custom connector say `foo`, all DataConnectionType objects will automatically be updated to reflect that ingestion via Arrow Flight is available. 
 
 **2. REST service routing**
 
