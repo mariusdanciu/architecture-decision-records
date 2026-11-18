@@ -54,29 +54,34 @@ Usage metering and budget enforcement is a major feature of AI Gateway and a ver
 
 ```mermaid
 flowchart LR
- subgraph redis_system["Redis system"]
-        redis[("Redis - counters")]
-  end
- subgraph praxis_pod["Praxis Pod"]
-    direction TB
-        praxis["Praxis<br>(proxy)"]
-        sidecar["Budget Sidecar<br>Container<br>(localhost)"]
-        otel_collector["OTEL Collector"]
-  end
- subgraph control_plane["Control Plane"]
-        aigc["AI Gateway Controller"]
- end
  subgraph budget_system["Budget System"]
     direction TB
         postgres[("PostgreSQL")]
         budget_service["Budget Service"]
  end
- subgraph obs["Observability"]
-        loki["Loki"]
+ subgraph rhoai["RHOAI"]
+    direction TB
+     subgraph control_plane["Control Plane"]
+            aigc["AI Gateway Controller"]
+     end
+     subgraph praxis_pod["Praxis Pod"]
+        direction TB
+            praxis["Praxis<br>(proxy)"]
+            sidecar["Budget Sidecar<br>Container<br>(localhost)"]
+      end
+        otel_collector["OTEL Collector"]
+        talkback["Talk-Back<br>Component"]
+     subgraph obs["Observability"]
+            loki["Loki"]
+     end
+     subgraph redis_system["Redis system"]
+            redis[("Redis - counters")]
+     end
  end
 
     aigc -- manages --> praxis_pod
     aigc -- manages --> budget_system
+    aigc -- manages --> talkback
     praxis -- is allowed? --> sidecar
     sidecar -- check & deduct balance --> redis
     sidecar -- allow / deny --> praxis
@@ -86,16 +91,21 @@ flowchart LR
 
     otel_collector -- CloudEvents --> budget_service
     otel_collector -- OTEL Log --> loki
-    budget_service -. change notifications .-> redis
+    otel_collector -. usage events .-> byom["Bring Your Own<br>Metering"]
     sidecar -- fetch config --> budget_service
-    budget_service -- metering APIs --> byom["Bring Your Own<br>Metering"]
+    talkback -- poll / push: user budget status --> budget_service
+    talkback -. alt: budget authority .-> byom
+    talkback -- set allowance --> redis
 ```
 
 Notes:
 - In the Praxis POD, AIGC also brings in the BSC (Budget Sidecar Container)
 - Praxis filter remains a PEP (Policy Enforcement Point). All budget calculations happen in the budgeting system (sidecar container and/or budget service)
-- Redis/Valkey is used for atomic balance counters and change notification Pub/Sub. The Budget Service publishes change notifications to Redis when configuration objects are updated; sidecars subscribe and fetch the changed objects from the Budget Service REST API. Configuration objects (policies, rates, budget definitions) are cached in the sidecar's memory, not stored in Redis.
-- To limit the number of dependencies, this proposal does not assume the existence of a pub/sub system such as Kafka. However, adding one later can be considered as a mechanism to control back pressure and provide ordering for deduplication. The OTEL Collector could also be a candidate for deduplication, but this ADR does not prescribe an OTEL Collector design. We assume that an existing OTEL Collector is used and that it is at least capable of receiving the usage events and propagating them to both the SoR as OTEL logs and to the Budget Service as CloudEvents.
+- Redis/Valkey is used only for atomic balance counters — not for configuration objects or change propagation. Configuration objects (policies, rates, budget definitions) are cached in the sidecar's memory and kept current by the sidecar polling the Budget Service REST API directly, with no dependency on Redis. The Budget Service (an external system, outside RHOAI) never writes to Redis directly — the only writer of Redis balances other than the sidecar is the Talk-Back Component (inside RHOAI).
+- The OTEL Collector and the Talk-Back Component are both cluster-wide RHOAI services — unlike the sidecar, neither is per-gateway or per-Praxis-pod. Both, along with the Control Plane, the Praxis Pod, Observability, and Redis, are part of RHOAI; only the Budget System (Budget Service, Postgres) sits outside RHOAI, and it can be swapped for a third-party metering platform without RHOAI itself changing.
+- The Talk-Back Component is a standalone service, deployed outside the Budget System, that keeps each user's/budget's Redis allowance up to date. It retrieves budget status from whichever system is the budget authority — the Budget Service by default, or an external metering platform when one is configured (see [Bring Your Own Metering](#bring-your-own-metering)) — and writes the resulting allowance into Redis. This is what makes the Budget Service itself replaceable: the sidecar and Praxis only ever read/write Redis and never need to know which system is authoritative. See [Talk-Back Component](#talk-back-component) for details.
+- To limit the number of dependencies, this proposal does not assume the existence of a pub/sub system such as Kafka. However, adding one later can be considered as a mechanism to control back pressure and provide ordering for deduplication. The OTEL Collector could also be a candidate for deduplication, but this ADR does not prescribe an OTEL Collector design. We assume that an existing OTEL Collector is used and that it is at least capable of receiving the usage events and propagating them to the SoR as OTEL logs, to the Budget Service as CloudEvents, and — when a third-party metering system is configured — directly to that system as well. Usage-event distribution is unaffected by the Talk-Back Component — the OTEL Collector always delivers CloudEvents to the Budget Service regardless of which system is the budget authority.
+- The OTEL Collector can fan out usage events to an external metering system directly, independently of the Budget Service, by adding a second exporter to its existing pipeline (see [Bring Your Own Metering](#bring-your-own-metering)). This does not require any change to the Budget Service, Praxis, or the sidecar.
 
 #### Inference Flow (budget check)
 
@@ -155,52 +165,47 @@ sequenceDiagram
     participant Operator
     participant BudgetService as Budget Service
     participant Postgres
-    participant Redis
     participant Sidecar1 as Sidecar (pod 1)
     participant Sidecar2 as Sidecar (pod 2)
-
-    Note over Sidecar1,Sidecar2: Subscribed to Redis<br>Pub/Sub {tenant}:changes
 
     Operator->>BudgetService: PUT /api/v1/rates/{id}<br>(X-Tenant: acme-corp)
     BudgetService->>Postgres: persist updated rate
     Postgres-->>BudgetService: ok
-    BudgetService->>Redis: PUBLISH acme-corp:changes<br>{type: "rate", id: "standard"}
     BudgetService-->>Operator: 200 OK
 
-    Redis--)Sidecar1: notification: rate "standard" changed
-    Redis--)Sidecar2: notification: rate "standard" changed
+    Note over Sidecar1,Sidecar2: Each sidecar polls independently,<br>on its own interval
 
-    par Sidecar 1 refreshes
+    par Sidecar 1 polls
         Sidecar1->>BudgetService: GET /api/v1/rates/standard<br>(X-Tenant: acme-corp)
         BudgetService-->>Sidecar1: updated rate
-        Note over Sidecar1: Update in-memory cache
-    and Sidecar 2 refreshes
+        Note over Sidecar1: Update in-memory cache<br>if changed
+    and Sidecar 2 polls
         Sidecar2->>BudgetService: GET /api/v1/rates/standard<br>(X-Tenant: acme-corp)
         BudgetService-->>Sidecar2: updated rate
-        Note over Sidecar2: Update in-memory cache
+        Note over Sidecar2: Update in-memory cache<br>if changed
     end
 ```
 
 ##### Budget Service ↔ Sidecar Sync
 
-The sidecar fetches configuration objects (policies, rates, budget definitions) from the Budget Service REST API and caches them in memory. Redis is used only for balance counters and lightweight change notifications — not for storing configuration objects.
+The sidecar fetches configuration objects (policies, rates, budget definitions) from the Budget Service REST API and caches them in memory. Redis is used only for balance counters — not for storing configuration objects or propagating configuration changes. The Budget Service is an external system, outside RHOAI, and never writes to Redis; the sidecar's config sync is a sidecar-initiated, pull-only relationship with the Budget Service's REST API.
 
 Each gateway serves exactly one tenant and may have multiple Praxis pods. All sidecars for the same tenant share Redis balance counters, which makes Redis the natural coordination point for multi-replica consistency.
 
 ##### How state flows
 
 1. An operator creates or updates a rate, budget, or policy via the Budget Service REST API
-2. The Budget Service persists the change to the durable backend (Postgres by default) and publishes a change notification to Redis (e.g., via Pub/Sub: `{tenant}:changes` channel with the object type and ID)
-3. Each sidecar subscribes to its tenant's change notifications. On receiving a notification, it fetches the updated object from the Budget Service REST API and refreshes its in-memory cache
+2. The Budget Service persists the change to the durable backend (Postgres by default)
+3. Each sidecar periodically polls the Budget Service REST API for its tenant's policies, rates, and budgets, and refreshes its in-memory cache when it detects a change. The poll interval is operator-configurable, trading off propagation latency against load on the Budget Service
 
-On startup, the sidecar calls the Budget Service REST API to fetch all policies, rates, and budgets for its tenant and subscribes to Redis change notifications.
+On startup, the sidecar calls the Budget Service REST API to fetch all policies, rates, and budgets for its tenant, then continues polling on its interval.
 
 ##### What lives where
 
 | Store | Data | Role |
 |---|---|---|
-| Sidecar (in-memory) | Policies, rates, budget definitions | Cached configuration for admission decisions. Refreshed from the Budget Service API on startup and on change notifications |
-| Redis | Balances, change notifications | Atomic counters for the hot path (read by sidecar for checks, decremented by sidecar for deductions, reset by Budget Service for period renewal) and lightweight Pub/Sub for cache invalidation |
+| Sidecar (in-memory) | Policies, rates, budget definitions | Cached configuration for admission decisions. Refreshed from the Budget Service API on startup and on each poll |
+| Redis | Balances | Atomic counters for the hot path (read by sidecar for checks, decremented by sidecar for deductions, set/reset by the Talk-Back Component based on budget authority data) |
 | Budget Service (API) | Policies, rates, budget definitions, consumption | Authoritative source served from the durable backend. Sidecars fetch from here |
 
 ##### Consumption data
@@ -211,9 +216,43 @@ The sidecar does not report consumption back to the Budget Service. Consumption 
 
 | Scenario | Behavior |
 |---|---|
-| Redis unavailable | Sidecar serves decisions from its in-memory cache. Change notifications are missed — the sidecar continues with stale config until Redis recovers. Balance checks and deductions are unavailable — the sidecar applies fail-open or fail-closed per operator configuration |
-| Budget Service unavailable | Sidecar continues with its in-memory cache and Redis balances. Config changes are delayed until the Budget Service recovers. Consumption data continues to flow via the OTEL pipeline independently |
-| Sidecar restarts | Sidecar fetches its tenant's full state from the Budget Service REST API and subscribes to Redis change notifications |
+| Redis unavailable | Sidecar serves decisions from its in-memory cache. Balance checks and deductions are unavailable — the sidecar applies fail-open or fail-closed per operator configuration. Config polling is unaffected, since it never touches Redis |
+| Budget Service unavailable | Sidecar continues with its in-memory cache and Redis balances. Config polls fail silently and the sidecar keeps serving from its last-known cache until the Budget Service recovers. Consumption data continues to flow via the OTEL pipeline independently |
+| Sidecar restarts | Sidecar fetches its tenant's full state from the Budget Service REST API and resumes polling on its interval |
+| Talk-Back Component unavailable, or the budget authority behind it is unreachable | Redis keeps the last allowance the Talk-Back Component wrote. The sidecar keeps enforcing against that value — the hot path is unaffected. Allowance data becomes stale until the Talk-Back Component recovers or the authority becomes reachable again |
+
+
+#### Talk-Back Component
+
+The Talk-Back Component is what makes the Budget Service itself replaceable, as opposed to only its durable storage (see [Bring Your Own Metering](#bring-your-own-metering)).
+
+##### The Problem
+
+The sidecar's hot path reads and decrements a balance in Redis; it never calls the Budget Service directly. Something still has to keep that Redis balance aligned with the subject's actual, authoritative budget — on period renewal and on reconciliation. If the Budget Service itself wrote these values into Redis directly, an external metering platform could never become the budget authority without either sitting inside RHOAI or being given direct write access to RHOAI's Redis. Introducing a dedicated component for this job, one that can be pointed at the Budget Service or at an external metering platform, avoids both.
+
+##### What It Does
+
+The Talk-Back Component is a standalone, cluster-wide RHOAI service — not per-gateway or per-Praxis-pod, and not part of the Budget System. It is a peer of the Budget System, which is what lets it be pointed at an external metering platform instead of the Budget Service without that platform having to integrate with, or sit inside, the Budget System. It:
+
+| Responsibility | Description |
+|---|---|
+| Retrieve budget status | Reads per-subject budget/allowance data from the configured budget authority — the Budget Service by default, or an external metering platform when one is configured (see [Bring Your Own Metering](#bring-your-own-metering)) |
+| Update Redis allowance | Writes the resulting allowance into the same `{tenant}:balance:{budget_id}` key the sidecar already reads (see [Redis/Valkey](#redisvalkey)) |
+| No hot-path involvement | Operates out-of-band, independently of individual inference requests. It is not part of the Praxis ↔ Sidecar check/deduct protocol and never sees per-request traffic |
+| No deduction | Deduction after actual usage remains exclusively the sidecar's responsibility (`DECRBY` on Redis). The Talk-Back Component only ever sets/refreshes the allowance baseline — it does not compute or apply per-request cost |
+
+Because the sidecar and Praxis only ever interact with Redis (and, for config, the Budget Service's REST API for rates/budgets/policies, which is unchanged), neither needs to know whether the Talk-Back Component is sourcing allowance data from the Budget Service or from a third-party metering system. Swapping the budget authority is entirely a Talk-Back Component configuration change.
+
+##### Sync Triggers
+
+How the Talk-Back Component learns that a subject's allowance changed depends on what the configured budget authority supports:
+
+| Mode | Description |
+|---|---|
+| Push | The budget authority notifies the Talk-Back Component (e.g., webhook or event) when a subject's allowance changes |
+| Poll | The Talk-Back Component periodically queries the budget authority's API for current allowance |
+
+The Budget Service supports both modes. A third-party metering platform may support only one, in which case the Talk-Back Component uses whichever mode that platform exposes.
 
 
 #### Multi-Tenancy
@@ -414,12 +453,12 @@ The budget system owns the sidecar and controls all caching and sync behavior:
 | Deny locally | When the balance is clearly exhausted |
 | Deduct locally | After the model responds, compute BU cost from in-memory rates and atomically decrement Redis balance via `DECRBY`. This keeps balance updates synchronous and minimizes the overshoot window |
 | Fail-open / fail-closed | Operator-configured behavior when Redis is unreachable |
-| Cache refresh | Fetch config from Budget Service API on startup, subscribe to Redis Pub/Sub for change notifications, fetch updated objects on demand |
+| Cache refresh | Fetch config from Budget Service API on startup, then poll on an interval for changes |
 | No consumption reporting | Consumption data flows to the Budget Service via the OTEL pipeline (Praxis → OTEL Collector → CloudEvent), not from the sidecar. The sidecar deducts from Redis for real-time balance accuracy, but does not persist usage to Postgres |
 
 #### What This Solves
 
-**Fleet coherence.** All sidecars for the same tenant share Redis balance counters and receive the same Pub/Sub change notifications. Multiple Praxis replicas with their own sidecars are automatically coordinated — balances are shared atomically via Redis, and config changes propagate to all sidecars via the notification + fetch pattern.
+**Fleet coherence.** All sidecars for the same tenant share Redis balance counters and poll the same Budget Service for config. Multiple Praxis replicas with their own sidecars are automatically coordinated — balances are shared atomically via Redis, and config changes propagate to all sidecars as each one's poll picks up the change.
 
 **Availability.** The sidecar depends on Redis for balances and on the Budget Service API for config. A Budget Service outage blocks config refreshes and management API changes but does not affect admission decisions — the sidecar continues serving from its in-memory cache and Redis balances.
 
@@ -500,7 +539,7 @@ The sidecar:
 
 Separately, Praxis emits an OTEL Log with the actual token usage. The OTEL Collector transforms it into a CloudEvent and delivers it to the Budget Service, which persists the usage record(s) to Postgres. This is the durable record for reporting, overage tracking, and reconciliation — not the real-time balance path.
 
-The Budget Service writes to Redis only for period renewal (`SET`) and reconciliation (rebuild from Postgres if Redis state is lost).
+Redis is otherwise only written on period renewal and reconciliation, which is the Talk-Back Component's job, not the sidecar's or the Budget Service's (see [Talk-Back Component](#talk-back-component)).
 
 #### Why No Reservation System
 
@@ -514,12 +553,14 @@ When the sidecar detects that a budget is over (balance <= 0 at check time), Pra
 
 When a deduction drives the Redis balance negative, the sidecar continues to operate — subsequent budget checks see a negative balance and apply hard or soft enforcement accordingly. The Budget Service tracks the cumulative overage for each budget from the usage ledger in Postgres.
 
-At period renewal, the Budget Service resets the Redis balance to the budget limit. If the BudgetPolicy has `deduct_overage` enabled, the Budget Service subtracts the previous period's overage from the new balance:
+At period renewal, the Budget Service computes the new balance for the budget. If the BudgetPolicy has `deduct_overage` enabled, the Budget Service subtracts the previous period's overage from the new balance:
 
 ```
 new_balance = limit - previous_period_overage   (if deduct_overage is true)
 new_balance = limit                              (if deduct_overage is false or absent)
 ```
+
+The Talk-Back Component retrieves this computed value from the Budget Service (or, when a third-party metering platform is the configured budget authority, from that platform) and writes it to the Redis balance key — see [Talk-Back Component](#talk-back-component).
 
 This ensures that overspend in one period is not silently forgiven — it reduces the next period's capacity. The `deduct_overage` field is optional on BudgetPolicy and defaults to false (overage is not carried forward).
 
@@ -550,11 +591,11 @@ Redis and Postgres serve different roles in the budget system:
 
 | Layer | Store | Purpose |
 |---|---|---|
-| Sidecar (in-memory) | Memory | Cached policies, rates, and budget definitions. Fetched from the Budget Service API, refreshed via Redis change notifications |
-| Hot path (shared) | Redis | Atomic balance counters and Pub/Sub change notifications |
+| Sidecar (in-memory) | Memory | Cached policies, rates, and budget definitions. Fetched from the Budget Service API on startup and refreshed by polling |
+| Hot path (shared) | Redis | Atomic balance counters, set by the Talk-Back Component and decremented by the sidecar |
 | Durable (default backend) | Postgres | Authoritative ledger, budget/rate/policy definitions, usage history, reconciliation |
 
-The sidecar caches configuration objects (policies, rates, budget definitions) in memory, fetched from the Budget Service REST API. Redis handles only what requires shared atomic state — balance counters — plus lightweight Pub/Sub notifications for cache invalidation.
+The sidecar caches configuration objects (policies, rates, budget definitions) in memory, fetched from the Budget Service REST API by polling on an interval. Redis handles only what requires shared atomic state — balance counters.
 
 Postgres is the default durable backend because it is already supported and operated in RHOAI. For the usage ledger workload (append-only writes, time-range aggregation queries), Postgres is adequate at single-cluster scale — LLM inference throughput bounds the event rate to a level well within Postgres capabilities. Table partitioning by time range and BRIN indexes on timestamp columns keep query performance acceptable as the ledger grows.
 
@@ -568,8 +609,8 @@ Redis operations:
 
 - **Check (sidecar, before dispatch):** `GET {tenant}:balance:{budget_id}` — read the current balance to make an admission decision.
 - **Deduct (sidecar, after model responds):** `DECRBY {tenant}:balance:{budget_id} <actual_bu_cost>` — atomically decrement by the actual BU cost. The balance may go negative (overage). This happens synchronously in the request path for real-time accuracy.
-- **Reset (Budget Service, on period renewal):** `SET {tenant}:balance:{budget_id} <new_balance>` — set balance to `limit` (or `limit - previous_overage` if `deduct_overage` is enabled on the policy).
-- **Reconcile (Budget Service, on demand):** `SET {tenant}:balance:{budget_id} <reconciled_balance>` — rebuild the Redis balance from the Postgres usage ledger if Redis state is lost or suspected to be incorrect.
+- **Reset (Talk-Back Component, on period renewal):** `SET {tenant}:balance:{budget_id} <new_balance>` — set balance to `limit` (or `limit - previous_overage` if `deduct_overage` is enabled on the policy), as computed by the budget authority. See [Talk-Back Component](#talk-back-component).
+- **Reconcile (Talk-Back Component, on demand or on a poll/push cycle):** `SET {tenant}:balance:{budget_id} <reconciled_balance>` — rebuild the Redis balance from the budget authority's current view (the Postgres usage ledger by default, or a third-party metering platform's own records) if Redis state is lost or suspected to be incorrect.
 
 
 ### Pacing
@@ -1105,6 +1146,8 @@ Response:
 
 After a model responds, Praxis emits an OTEL Log record containing the resource identification and actual token usage. The OTEL Collector forwards this as a CloudEvent to the Budget Service, which persists the usage record(s) to Postgres. This is the durable persistence path for reporting, overage tracking, and reconciliation. The real-time balance deduction is handled by the sidecar (see [Deduct Budget](#deduct-budget)).
 
+When a third-party metering system is configured (see [Bring Your Own Metering](#bring-your-own-metering)), the OTEL Collector also forwards usage events directly to that system's ingestion endpoint, in parallel with — and independently of — delivery to the Budget Service. Praxis and the sidecar are unaffected either way; they only ever emit the one OTEL Log record described below.
+
 The OTEL Log record carries the following attributes:
 
 ```json
@@ -1272,14 +1315,13 @@ Append-only ledger of usage records. This is the durable record that feeds repor
 
 #### Redis/Valkey
 
-Redis handles atomic shared state and change notifications. Configuration objects (policies, rates, budget definitions) are not stored in Redis — they are cached in sidecar memory and served by the Budget Service API. All keys are namespaced by tenant ID.
+Redis handles atomic shared state only. Configuration objects (policies, rates, budget definitions) are not stored in Redis — they are cached in sidecar memory and kept current by the sidecar polling the Budget Service API. All keys are namespaced by tenant ID.
 
 | Key pattern | Type | Description |
 |---|---|---|
-| `{tenant}:balance:{budget_id}` | integer | Current BU balance for a budget. Decremented atomically by the sidecar after each response via `DECRBY`. May go negative (overage). Reset by the Budget Service on period renewal |
-| `{tenant}:changes` | Pub/Sub channel | Change notifications published by the Budget Service when a policy, rate, or budget is created, updated, or deleted. Payload contains the object type and ID. Sidecars subscribe to this channel and fetch the changed object from the Budget Service API |
+| `{tenant}:balance:{budget_id}` | integer | Current BU balance for a budget. Decremented atomically by the sidecar after each response via `DECRBY`. May go negative (overage). Set/reset by the Talk-Back Component on period renewal and reconciliation (see [Talk-Back Component](#talk-back-component)) |
 
-The balance key is the critical path — the sidecar reads it for admission checks and atomically decrements it on deduction. The Budget Service writes to balance keys only for period renewal and reconciliation.
+The balance key is the critical path — the sidecar reads it for admission checks and atomically decrements it on deduction. The Talk-Back Component writes to the balance key only for period renewal and reconciliation; it never participates in the per-request check/deduct path.
 
 **Note:** The low-level schema details are intentionally omitted from this document as they tend to change as the design and implementation evolve, risking this information becoming outdated. For this reason we aim to cover only the high-level aspects here.
 
@@ -1290,29 +1332,32 @@ The Budget Service is designed as a self-contained solution that works out of th
 
 #### Integration boundary
 
-All external metering integration happens exclusively at the Budget Service level. The rest of the stack — Praxis, the sidecar, Redis, the OTEL pipeline — remains completely unchanged and unaware of any external backend. This is a deliberate architectural choice:
+External metering integration happens at three well-defined points: the Budget Service, the Talk-Back Component, and the OTEL Collector. The rest of the RHOAI stack — Praxis, the sidecar, Redis — remains completely unchanged and unaware of any external backend. This is a deliberate architectural choice:
 
-- **Praxis** continues to call the sidecar for admission decisions. It does not know whether consumption data is forwarded elsewhere.
-- **The sidecar** continues to fetch config from the Budget Service API and use Redis for balances. Its sync protocol is unchanged.
-- **The OTEL pipeline** continues to emit logs and CloudEvents to the Budget Service. No additional collectors or exporters are needed.
+- **Praxis** continues to call the sidecar for admission decisions. It does not know whether consumption data is forwarded elsewhere, or where the sidecar's balances ultimately come from.
+- **The sidecar** continues to fetch config from the Budget Service API and check/deduct against Redis balances. Its sync protocol and its check/deduct protocol are unchanged.
+- **The OTEL Collector** always delivers CloudEvents to the Budget Service. When a third-party metering system is configured, it additionally forwards usage events directly to that system via a second exporter — a pipeline configuration change, not a change to the Collector's design or to any other component.
+- **The Talk-Back Component** is the only RHOAI component that needs to know whether it is talking to the Budget Service or to an external budget authority (see [Budget authority replacement](#integration-patterns) below); it still only ever writes to Redis, so the sidecar's view of Redis is unaffected.
 
-The Budget Service acts as the single integration point, translating its internal consumption data into the format expected by the external system.
+The push, pull, and backend-replacement patterns below are entirely a Budget Service concern: they happen between the Budget Service and the external system, both outside RHOAI, and are not shown in the main [Architecture](#architecture) diagram since they never touch RHOAI. Direct usage distribution and budget authority replacement are the two patterns that do touch RHOAI — through the OTEL Collector and the Talk-Back Component, respectively — which is why they are the only ones depicted there.
 
 #### Integration patterns
 
 | Pattern | Description |
 |---|---|
+| Direct usage distribution (OTEL fan-out) | The OTEL Collector forwards usage events directly to the external system's ingestion endpoint as a second exporter, in parallel with and independent of CloudEvent delivery to the Budget Service. No Budget-Service-side integration is required |
 | Push (webhook/event) | The Budget Service forwards consumption events to an external system's ingestion endpoint (e.g., OpenMeter's event API or M360's usage API) as they are persisted |
 | Pull (metering API) | The external system queries the Budget Service's metering APIs to retrieve consumption data on its own schedule |
 | Backend replacement | The external system replaces Postgres as the durable store. The Budget Service writes budget objects and usage records to the external system instead of Postgres. Redis remains the operational store — Praxis, sidecars, and the OTEL pipeline are unaffected |
+| Budget authority replacement | The external system replaces the Budget Service as the source of truth for a subject's allowance. The Talk-Back Component polls or subscribes to the external system instead of the Budget Service, and writes the resulting allowance into Redis exactly as it would for Budget-Service-sourced data (see [Talk-Back Component](#talk-back-component)). Usage-event distribution is unaffected — the OTEL Collector still delivers CloudEvents to the Budget Service (and, if configured, directly to the external system) regardless of which system is the budget authority |
 
 #### What the external system receives
 
-The Budget Service can expose usage data: request ID, identity (user, groups, organization, tenant), resource keys (model, provider, region), usage keys (token counts), BU cost, and timestamp. The external system can then apply its own pricing, aggregation, and billing logic.
+Whether via OTEL fan-out or the Budget Service's own push/pull APIs, the external system receives the same shape of usage data: request ID, identity (user, groups, organization, tenant), resource keys (model, provider, region), usage keys (token counts), BU cost (when computed by the Budget Service; OTEL fan-out delivers raw usage, since BU cost is a Budget Service computation), and timestamp. The external system can then apply its own pricing, aggregation, and billing logic.
 
 #### What the external system does not control
 
-Budget enforcement decisions (allow/deny) remain with the Budget Service and its sidecars. The external system is a consumer of usage data, not an authority on admission. If a customer wants the external system to influence budget limits, this is done by updating budgets and rates via the Budget Service's management API — not by bypassing the sidecar.
+The external system never talks to Praxis or the sidecar directly, and it cannot bypass the check/deduct protocol — the sidecar is still the sole enforcement point, and all it ever consults is Redis. Under the Budget authority replacement pattern, however, the external system *does* become the authority behind the allowance the Talk-Back Component writes into Redis — so, unlike the other patterns, it can determine admission outcomes, just not by talking to the sidecar directly. For the OTEL fan-out, push, pull, and backend-replacement patterns, the external system remains a consumer of usage data, not an authority on admission; influencing budget limits in that case is done by updating budgets and rates via the Budget Service's management API.
 
 > **Note:** The specific integration details for each external platform (API mappings, authentication, retry policies) will be addressed in separate ADRs as those integrations are prioritized.
 
@@ -1368,7 +1413,7 @@ The RHOAI UI can query the Budget Service metering APIs to display:
 | 1 | **Fail-open or fail-closed default?** | When Redis is unreachable, should the sidecar allow requests (fail-open) or reject them (fail-closed)? This is operator-configurable, but the default affects out-of-the-box behavior. Fail-open risks overspend; fail-closed risks blocking legitimate requests |
 | 2 | **Maximum negative balance tolerance** | When deductions drive a balance negative, how far negative is acceptable before the system takes corrective action? Concurrent requests between check and deduction can cause overshoot. Unbounded negative balances could indicate a problem |
 | 3 | **Redis persistence strategy** | Should Redis use AOF, RDB snapshots, or both? This affects how much balance data is lost on a Redis restart and how quickly it can be rebuilt from Postgres |
-| 4 | **Pub/Sub delivery guarantees** | Redis Pub/Sub is fire-and-forget — if a sidecar misses a notification (e.g., during a brief disconnect), it will serve stale config. Should the sidecar also poll the Budget Service API periodically as a fallback? If so, at what interval? |
+| 4 | **Config poll interval** | The sidecar polls the Budget Service API for config changes rather than being notified. What interval best balances propagation latency against load on the Budget Service, and should it be operator-configurable per tenant? |
 | 5 | **BudgetPolicy ↔ MaaSSubscription relationship** | Should a BudgetPolicy reference a MaaSSubscription? Currently, policies bind a subject to a budget and rate, but there is no explicit link to the subscription that governs the subject's access. A reference could enable subscription-scoped budget enforcement and usage visibility per subscription, but it introduces a dependency on the control plane's subscription model |
 
 
@@ -1408,9 +1453,10 @@ The hybrid approach uses each store for what it does best: Redis for the latency
 
 All communication between components happens exclusively within the Kubernetes cluster network over TLS:
 
-- **Sidecar → Budget Service** (REST API calls to fetch config) — in-cluster only, never exposed publicly
-- **Sidecar → Redis** (balance counters, Pub/Sub subscriptions) — in-cluster only
-- **Budget Service → Redis** (balance updates, change notifications) — in-cluster only
+- **Sidecar → Budget Service** (REST API calls to fetch config, by polling) — in-cluster only, never exposed publicly
+- **Sidecar → Redis** (balance counters) — in-cluster only
+- **Talk-Back Component → Budget Service** (poll/push for budget status) — in-cluster only
+- **Talk-Back Component → Redis** (balance updates) — in-cluster only
 
 The Praxis-to-sidecar communication is localhost only (same pod), so it does not traverse the network at all and requires no authentication. Both containers share the same pod security boundary — if one is compromised, the other is already accessible.
 
@@ -1426,7 +1472,7 @@ The AI Gateway Controller is responsible for creating the appropriate RoleBindin
 
 All management API requests require the `X-Tenant` header. The Budget Service validates that the caller has RBAC permissions for the specified tenant's resources. A missing or unauthorized `X-Tenant` header results in a 403 response.
 
-At the data plane level, each sidecar fetches only its own tenant's config from the Budget Service API (the `X-Tenant` header scopes the response) and reads only its tenant's Redis keys (see [Multi-Tenancy](#multi-tenancy)). Tenant isolation in Redis is enforced by key naming convention (`{tenant}:*`) and Pub/Sub channel naming (`{tenant}:changes`). Redis ACLs or separate Redis instances per tenant can provide stronger isolation if required.
+At the data plane level, each sidecar fetches only its own tenant's config from the Budget Service API (the `X-Tenant` header scopes the response) and reads only its tenant's Redis keys (see [Multi-Tenancy](#multi-tenancy)). Tenant isolation in Redis is enforced by key naming convention (`{tenant}:*`). Redis ACLs or separate Redis instances per tenant can provide stronger isolation if required.
 
 ### PII in Identity Fields
 
@@ -1434,7 +1480,7 @@ The `identity` object (user, groups, organization, tenant) flows through the OTE
 
 ### Redis Data Security
 
-Redis holds balance counters and Pub/Sub change notifications. It does not store configuration objects, usage records, or identity information. Redis should be configured with TLS for in-transit encryption and access restricted to the sidecar and Budget Service via network policies.
+Redis holds balance counters only. It does not store configuration objects, usage records, or identity information. Redis should be configured with TLS for in-transit encryption and access restricted to the sidecar and the Talk-Back Component via network policies. The Budget Service has no network access to Redis.
 
 ## Implementation notes
 
@@ -1444,9 +1490,9 @@ We recommend that the Budget Service and the Budget Sidecar be implemented in Ru
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| **Redis data loss** — Redis restart or crash loses balance counters | Medium | High | Redis persistence (AOF/RDB). Budget Service reconciliation rebuilds balances from Postgres usage records |
+| **Redis data loss** — Redis restart or crash loses balance counters | Medium | High | Redis persistence (AOF/RDB). The Talk-Back Component's reconciliation pulls from the Budget Service (or external budget authority) and Postgres to rebuild balances |
 | **Redis/Postgres divergence** — Sidecar decrements Redis but the CloudEvent never reaches the Budget Service (e.g., OTEL pipeline failure). Redis balance is correct, but Postgres is missing usage records | Low | Medium | Budget Service reconciliation detects the discrepancy (Redis balance is lower than the Postgres-computed balance). Missing records can be recovered from OTEL logs in Loki |
-| **Missed Pub/Sub notifications** — Sidecar misses a Redis change notification and serves stale config (wrong rates or policies) | Low | Medium | Optional periodic polling of the Budget Service API as a fallback. Sidecar restart triggers a full config fetch |
+| **Stale config between polls** — Sidecar serves wrong rates or policies for up to one poll interval after a change | Low | Medium | Operators tune the poll interval to balance propagation latency against load on the Budget Service. Sidecar restart triggers a full config fetch |
 | **Concurrent request overshoot** — Multiple requests pass the balance check before their deductions land, causing the balance to go negative | Low | Low | The overshoot window is minimal — deductions happen synchronously in the sidecar via Redis `DECRBY`, not via an async pipeline. Only truly concurrent requests (overlapping check-to-deduct windows) can overshoot. Negative balances block subsequent hard admissions. The `deduct_overage` policy option ensures overshoot is recovered in the next period |
 | **Sidecar memory pressure** — Tenants with many policies, rates, or budget definitions cause high memory usage in the sidecar | Low | Low | Config objects are small (KV maps). Monitor sidecar memory usage. If needed, limit the number of objects per tenant |
 | **Budget Service as single point for config** — Budget Service outage prevents config refresh for all sidecars | Medium | Low | Sidecars continue with in-memory cached config. Only new config changes are delayed. Admission decisions and Redis balances are unaffected |
