@@ -634,6 +634,21 @@ These rules are evaluated by the Budget Service when it resolves the budgets cha
 
 ### API: REST
 
+> **Price Tag API surface — endpoint comparison.** Price Tag's endpoints do not line up with this API. Per section:
+>
+> | This ADR | Price Tag today | Verdict |
+> |---|---|---|
+> | `POST` CloudEvent usage (via collector) | `POST /api/v1/events` — same contract, direct from the gateway filter | Exists, compatible |
+> | Admission read (crate over Redis) | `GET /api/v1/customers/{user}/entitlements/{key}/value` (OpenMeter-style, [entitlements.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/entitlements.go)) and `POST /api/v2/policy/decide` (AuthZEN) | Different mechanism — see the PT-MAJOR note on the Admission Contract; the entitlement endpoint is the interim seam |
+> | `GET/POST/PUT/DELETE /api/v1/rates` | Nothing. Prices are seeded from LiteLLM at startup plus a discount-policy admin endpoint | Does not exist |
+> | `GET/POST/PUT/DELETE /api/v1/budgets` | `GET/PUT /api/v1/admin/safety-net` — the global `quota_policy` singleton only, behind an OIDC session gate | Slightly different: global-only, partial verbs, different auth |
+> | `GET/POST/PUT/DELETE /api/v1/budget_policies` | Nothing over HTTP. `quota_overrides` writes exist only as the DB function `UpsertQuotaOverride` ([quota.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)); the PoC sets budgets via direct SQL | Does not exist (write path missing entirely) |
+> | `GET /api/v1/usage` (group_by/granularity/filters) | `/api/v1/usage/users/{user}` and `/api/v1/usage/reports` (batch), secret-gated, dashboard-shaped; hourly rollup tables | Slightly different: fixed shapes, no grouping/granularity |
+> | `GET /api/v1/usage/me` | `/api/v1/me/*` endpoints exist but are session-cookie dashboard APIs, not the self-scoped metering API specified here | Slightly different: different auth model and response shape |
+> | `X-Tenant` header on all management calls | Not present anywhere | Does not exist (single tenant) |
+>
+> Net: the usage-event and (interim) admission endpoints exist; every management endpoint is either absent (rates, budget policies, tenant scoping) or a differently-shaped partial (budgets, usage queries). The management API is new build work that lands with the object model.
+
 The Budget Service exposes a REST API for managing rates, budgets, and budget policies. All endpoints require the `X-Tenant` header.
 
 > **Note:** The exact request and response payloads will be defined in a separate API specification document.
@@ -1389,6 +1404,7 @@ Summary of what the initial release inherits from Price Tag, what needs major wo
 | `request_id` correlation | Not carried in the event schema |
 | OTEL Collector pipeline + Loki audit copy | Direct filter-to-service HTTP today; no recovery copy, no collector-side retry buffering |
 | Usage query API (`group_by`/`granularity`/filters) and `/usage/me` | Dashboard-oriented report endpoints only |
+| Management REST API (rates, budgets, budget policies CRUD with `X-Tenant`) | No rates or budget-policy HTTP surface at all; budgets are the `safety-net` singleton endpoint; per-user overrides are DB-only. See the endpoint table under [API: REST](#api-rest) |
 | Bring Your Own Metering (`embedded`/`federated`, adapters, overage callbacks) | Entirely new work, post-initial-release |
 | Reconciliation (recompute balances/flags from ledger) | Rollup backfill exists for dashboards; no decision reconciliation |
 | Tenant binding of events (derive tenant from sender identity, reject payload mismatch) | Events trusted as sent |
