@@ -19,6 +19,17 @@
 
 This document proposes a new usage metering solution that is part of the RHOAI product. It allows customers to configure and manage costs and attribution and also visualize usage in the UI dashboards.
 
+## Relationship to Price Tag (pricetag-metering)
+
+The **initial release of the Budget Service will be based heavily on what is currently implemented in [Price Tag](https://github.com/jland-redhat/pricetag-metering)** (pricetag-metering), the metering service developed for the ENMaaS dogfooding effort. Price Tag already implements, end to end: CloudEvent token-usage ingestion from the Praxis `external_metering` gateway filter ([`internal/handler/events.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/events.go)), per-event pricing with the cost frozen into a Postgres `usage_events` ledger ([`internal/storage/postgres.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/postgres.go)), USD budgets with a per-user override model ([`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)), a synchronous admission decision consumed by the gateway pre-inference ([`internal/handler/entitlements.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/entitlements.go)), and LiteLLM-derived model pricing with a discount policy table ([`internal/pricing/pricing.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/pricing/pricing.go)).
+
+This document describes the **target architecture**. Where Price Tag already satisfies it, this ADR notes the compatibility directly. Where it does not, the ADR carries one of two inline markers:
+
+* `PT-SMALL` — a small change makes Price Tag compatible with this section (usually a naming, transport, or default-value decision). Each note links the Price Tag code it applies to.
+* `PT-MAJOR` — the section requires a major change in Price Tag (new subsystem, schema rewrite, or a different enforcement mechanism). These drive the release plan.
+
+A consolidated gap analysis, including capabilities Price Tag does not have at all, is in [Price Tag Gap Analysis](#price-tag-gap-analysis).
+
 ## Why
 
 Usage metering and budget enforcement is a major feature of AI Gateway and a very frequent topic raised by customers.
@@ -198,6 +209,8 @@ Consumption data is the only accounting input. Praxis emits an OTEL Log after ea
 
 #### Multi-Tenancy
 
+> **PT-MAJOR — major change required.** Price Tag has no tenant scoping on the metering/quota path: no `X-Tenant` header, no tenant column in `quota_policy`/`quota_overrides`/`usage_events` (a `policy_tenants` table exists only for the separate model-access feature). The initial release ships single-tenant per deployment; tenant columns and header scoping arrive with the quota rewrite. See [Price Tag Gap Analysis](#price-tag-gap-analysis).
+
 The Budget Service is a single shared instance serving all tenants (soft multi-tenancy). All data is tenant-scoped and every management API request must carry the `X-Tenant` header to identify which tenant's budgets, rates, or policies are being managed.
 
 At the gateway level, each gateway serves exactly one tenant. The Praxis read credential is scoped to that tenant: it can read only `{tenant}:admit:*` and nothing else. Because Praxis never writes budget state, the data-plane identity is read-only, which makes cross-tenant tampering a configuration error rather than an exploitable path.
@@ -211,6 +224,8 @@ At the gateway level, each gateway serves exactly one tenant. The Praxis read cr
 
 
 ### Budget object model
+
+> **PT-MAJOR — major change required.** Price Tag has no Rate/Budget/BudgetPolicy object model. It implements a single global `quota_policy` row (default monthly USD, enforced flag, post-cap model allowlist) plus per-user `quota_overrides` rows, with the effective limit resolved as user override > role budget > policy default in [`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go). Adopting this object model is a rewrite of that quota layer, and it is the largest single work item in the adoption plan.
 
 The budget domain is modeled with three objects: **Rate**, **Budget**, and **BudgetPolicy**.
 
@@ -246,6 +261,8 @@ Pure capacity definition — how much BU and when it resets. No subject, no enfo
 
 **Renewal** variants:
 
+> **PT-MAJOR — major change required.** Price Tag periods are the calendar month, hardwired (`date_trunc('month', NOW())` in the quota policy lookup, [`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)). There is no configurable `period.duration`, no anchor, no `drain`/`rollover` distinction, and no `max_carry` or `deduct_overage` carry-forward — overage is recorded in the ledger but never deducted from the next period.
+
 | Variant | Fields | Description |
 |---|---|---|
 | `drain` | — | Use it or lose it; balance resets to `limit` each period |
@@ -267,6 +284,8 @@ Binds one or more subjects to a budget with a rate table and optional overage be
 
 If `overage` is absent, enforcement is **hard** — requests are rejected with 429 when the budget is exceeded.
 
+> **PT-MAJOR — major change required.** Price Tag is hard-enforcement only. The closest existing mechanisms are `allowed_over_limit_models` (an exact-match model allowlist that still passes the entitlement check after the dollar cap) and the automatic zero-cost-model allowlist, both in [`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go). Soft overage with `x-praxis-over-budget`, and the `group`/`organization`/`tenant` fallback chain, do not exist. The initial release ships hard enforcement only; the `over` state arrives with the object-model rewrite.
+
 **Overage** variants:
 
 | Variant | Fields | Description |
@@ -280,6 +299,8 @@ If `overage` is absent, enforcement is **hard** — requests are rejected with 4
 
 
 #### Budget Units (BU) as the Accounting Abstraction
+
+> **PT-MAJOR — major change required.** Price Tag is USD-denominated end to end: budgets are `monthly_usd`, events are priced in dollars from LiteLLM list prices plus a discount policy table ([`internal/pricing/pricing.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/pricing/pricing.go)), and the admission decision compares dollar spend to a dollar limit. There is no Budget Unit abstraction and no admin-defined rate tables; the initial release therefore ships USD budgets, and BU (with per-subject rate tables) arrives with the object-model rewrite above.
 
 Budget Units are an important simplification from actual currency and reinforce the claim that this is not a billing system. Customers can attribute actual currency amounts per BU if necessary, but again this is not the SoR.
 
@@ -374,6 +395,8 @@ The key advantage over MaaSSubscription is per-subject flexibility. When subject
 
 ### Admission Contract
 
+> **PT-MAJOR — major change required.** Price Tag's admission path is the synchronous pattern this ADR lists under Alternatives and rejects: the gateway filter calls `GET /api/v1/customers/{user}/entitlements/{key}/value` per request (an OpenMeter-style endpoint built for the ENMaaS `enmaas_policy`/Praxis `external_metering` filters, [`internal/handler/entitlements.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/entitlements.go)), served off a month-to-date SQL aggregation with LRU decision caches (~15s role cache, ~30-60s quota cache, [`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)). There is no Redis, no admission crate, and no `allow/over/deny` flag. The initial release keeps the synchronous endpoint (the decision cache is a stand-in for the flag), and the Redis flag + crate contract lands as the follow-up release that takes Praxis off the synchronous path. Until then the latency, availability-coupling, and contention concerns in [Synchronous budget checks against the Budget Service](#synchronous-budget-checks-against-the-budget-service) apply and are accepted for the initial release.
+
 #### The Problem
 
 Praxis needs an admission decision inside the request path, but that decision depends on policy resolution, rate matching, and cost computation — exactly the logic the budget system owns. The contract has to answer the question without moving that logic into the proxy, and without making inference depend on the Budget Service's availability.
@@ -450,7 +473,9 @@ The `identity` object contains the full context needed for both admission and po
 | `organization` | SelfTokenReview or OIDC token claims | Organization the user belongs to. Only known at request time |
 | `tenant` | Gateway configuration | The tenant served by this gateway. Fixed per gateway — not resolved per request |
 
-Identity resolution happens entirely within Praxis. Praxis passes the resolved identities to the admission read, and the Budget Service receives the same identities inside the usage event; neither component performs authentication or identity lookup on the other's behalf. The read set is exactly the identity set: one flag per user, group, organization, and tenant carried by the request.
+Identity resolution happens entirely within Praxis.
+
+> **PT-MAJOR — major change required.** Price Tag resolves only the username (optionally aggregated across a person's logins through a partner-users directory). Group- and grant-based resolution were removed with the legacy org directory — see the comments on `quotaDecision` in [`internal/storage/quota.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go). Subjects of kind `group`, `organization`, and `tenant` do not exist on the budget path today. Praxis passes the resolved identities to the admission read, and the Budget Service receives the same identities inside the usage event; neither component performs authentication or identity lookup on the other's behalf. The read set is exactly the identity set: one flag per user, group, organization, and tenant carried by the request.
 
 The fact that group and organization membership is only known at request time has implications for policy validation and ambiguity resolution (see [Validation Rules](#validation-rules)).
 
@@ -486,6 +511,8 @@ Praxis resolves the request's identities and reads their flags. A `deny` from an
 Praxis emits an OTEL Log with the actual usage. The OTEL Collector transforms it into a CloudEvent and delivers it to the Budget Service. The Budget Service:
 
 1. Prices the event against the rate version that was valid at `event.time`, so a rate change between the request and its ingestion cannot change what the request cost
+
+> **Missing capability (partial).** Price Tag freezes `cost_usd` into `usage_events` at ingest, so a priced row is never re-priced. But it keeps only the current price table (`model_pricing`) — there is no rate version history, so a late-arriving event is priced at today's rates, not the rates valid at `event.time`. A manual historical-repricing handler exists as an admin tool, not an automatic guarantee.
 2. Appends the ledger rows for the request
 3. Updates the balance for each charged budget
 4. Recomputes the admission flag for every identity object the charge touches, and writes the flags that changed
@@ -535,6 +562,8 @@ The Budget Service uses the CloudEvent `id` field as an idempotency key. The `us
 3. If one row was inserted — the usage record is persisted and the accounting for it is applied exactly once
 
 Deduplication protects the balances and flags as well as the ledger, because all three are updated in the same pass.
+
+> **Missing capability.** Price Tag does not deduplicate on the CloudEvent `id` — `usage_events` has no event-id uniqueness and [`internal/handler/events.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/events.go) inserts on every accepted POST. A retried delivery double-charges. Deduplication must be added before the initial release can be called correct under delivery retries.
 
 ### Storage Architecture: Redis + Postgres
 
@@ -605,6 +634,21 @@ These rules are evaluated by the Budget Service when it resolves the budgets cha
 
 ### API: REST
 
+> **Price Tag API surface — endpoint comparison.** Price Tag's endpoints do not line up with this API. Per section:
+>
+> | This ADR | Price Tag today | Verdict |
+> |---|---|---|
+> | `POST` CloudEvent usage (via collector) | `POST /api/v1/events` — same contract, direct from the gateway filter | Exists, compatible |
+> | Admission read (crate over Redis) | `GET /api/v1/customers/{user}/entitlements/{key}/value` (OpenMeter-style, [entitlements.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/entitlements.go)) and `POST /api/v2/policy/decide` (AuthZEN) | Different mechanism — see the PT-MAJOR note on the Admission Contract; the entitlement endpoint is the interim seam |
+> | `GET/POST/PUT/DELETE /api/v1/rates` | Nothing. Prices are seeded from LiteLLM at startup plus a discount-policy admin endpoint | Does not exist |
+> | `GET/POST/PUT/DELETE /api/v1/budgets` | `GET/PUT /api/v1/admin/safety-net` — the global `quota_policy` singleton only, behind an OIDC session gate | Slightly different: global-only, partial verbs, different auth |
+> | `GET/POST/PUT/DELETE /api/v1/budget_policies` | Nothing over HTTP. `quota_overrides` writes exist only as the DB function `UpsertQuotaOverride` ([quota.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)); the PoC sets budgets via direct SQL | Does not exist (write path missing entirely) |
+> | `GET /api/v1/usage` (group_by/granularity/filters) | `/api/v1/usage/users/{user}` and `/api/v1/usage/reports` (batch), secret-gated, dashboard-shaped; hourly rollup tables | Slightly different: fixed shapes, no grouping/granularity |
+> | `GET /api/v1/usage/me` | `/api/v1/me/*` endpoints exist but are session-cookie dashboard APIs, not the self-scoped metering API specified here | Slightly different: different auth model and response shape |
+> | `X-Tenant` header on all management calls | Not present anywhere | Does not exist (single tenant) |
+>
+> Net: the usage-event and (interim) admission endpoints exist; every management endpoint is either absent (rates, budget policies, tenant scoping) or a differently-shaped partial (budgets, usage queries). The management API is new build work that lands with the object model.
+
 The Budget Service exposes a REST API for managing rates, budgets, and budget policies. All endpoints require the `X-Tenant` header.
 
 > **Note:** The exact request and response payloads will be defined in a separate API specification document.
@@ -640,6 +684,8 @@ The Budget Service exposes a REST API for managing rates, budgets, and budget po
 | `DELETE` | `/api/v1/budget_policies/{id}` | Delete a policy |
 
 #### Usage Query
+
+> **Missing capability.** Price Tag serves per-user and batch usage-report endpoints oriented at its dashboards ([`internal/handler`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler)), backed by hourly rollup tables. There is no flexible `group_by`/`granularity`/filter query API and no self-scoped `/usage/me` endpoint. Both are new build items.
 
 ```
 GET /api/v1/usage
@@ -1051,6 +1097,15 @@ This OTEL Log record is also forwarded to Loki for observability.
 
 #### CloudEvent
 
+> **PT-SMALL — small changes for compatibility.** Two naming/transport decisions keep Price Tag compatible without code changes on its side:
+>
+> 1. **Token key names.** The initial release keeps the names the Praxis `external_metering` filter already emits and Price Tag already parses (see [`internal/handler/events.go`](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/events.go)): `prompt_tokens`, `completion_tokens`, `total_tokens`, `cached_input_tokens`, `cache_creation_tokens`, `reasoning_tokens` — rather than this document's `input_tokens`/`output_tokens`/`cache_read_tokens`/`cache_write_tokens` set. A mapping (`input_tokens` = `prompt_tokens`, `cache_read_tokens` = `cached_input_tokens`, `cache_write_tokens` = `cache_creation_tokens`) is applied when the full schema lands.
+> 2. **Event identity shape.** The initial release keeps the flat `data.user`/`data.model`/`data.provider` fields the filter emits, rather than the nested `data.identity`/`data.resource`/`data.usage` objects specified below. The nested shape arrives with the object-model rewrite.
+>
+> These are additive renames in the collector/filter; no Price Tag logic changes.
+>
+> **Missing capability (transport):** Price Tag receives events by direct HTTP POST from the gateway filter. There is no OTEL Collector hop and no Loki audit copy today — the observability leg of the pipeline (event recovery from Loki, collector-side retry buffering) does not exist yet and is required before the deduplication and reconciliation guarantees above hold.
+
 The OTEL Collector transforms the Log record into a CloudEvent and sends it to the Budget Service via HTTP. The CloudEvent follows the [CloudEvents v1.0 specification](https://cloudevents.io/):
 
 ```json
@@ -1189,6 +1244,8 @@ The critical path is `admit:*`: Praxis reads it on every request and touches not
 
 ### Bring Your Own Metering
 
+> **Missing capability.** Price Tag has no external-platform integration mode — no event forwarding, no metering API for external consumers beyond its own report endpoints, no overage-notification adapter. BYOM (`embedded`/`federated` modes, adapters) is entirely new work and is not part of the initial release.
+
 The Budget Service is designed as a self-contained solution that works out of the box. Customers who already operate an external metering or billing platform — OpenMeter, Monetize360, or a custom one — can place it behind the same admission contract.
 
 #### One contract, two provider modes
@@ -1309,6 +1366,51 @@ The RHOAI UI can query the Budget Service metering APIs to display:
 - Overage history (when and how often budgets were exceeded)
 
 
+## Price Tag Gap Analysis
+
+Summary of what the initial release inherits from Price Tag, what needs major work, and what is missing entirely. Inline `PT-SMALL`/`PT-MAJOR` notes above carry the per-section detail and code links.
+
+### Inherited as-is (initial release basis)
+
+| Capability | Price Tag implementation |
+|---|---|
+| CloudEvent token-usage ingestion | `POST /api/v1/events`, flat schema the Praxis `external_metering` filter emits ([events.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/events.go)) |
+| Per-event pricing, cost frozen at ingest | `cost_usd` frozen into `usage_events` ([postgres.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/postgres.go)) |
+| USD budgets + per-user overrides, effective-limit resolution | `quota_policy` / `quota_overrides` ([quota.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/storage/quota.go)) |
+| Synchronous admission decision (interim seam) | OpenMeter-style entitlement value endpoint ([entitlements.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/handler/entitlements.go)) |
+| Model pricing + discounts | LiteLLM price list with embedded fallback, discount policy table ([pricing.go](https://github.com/jland-redhat/pricetag-metering/blob/main/internal/pricing/pricing.go)) |
+| Hard enforcement (deny on exhaust, 429) | `quota_exhausted` deny reason; zero-cost and allowlisted models still pass |
+| Fail-open on metering unavailability | gateway filter `fail_open: true` — this also answers Open Question 1 for the initial release: fail-open |
+
+### Major changes required (PT-MAJOR)
+
+| Target capability | Gap in Price Tag |
+|---|---|
+| Redis admission flags + published crate | Not present. Synchronous HTTP decision with LRU caches is the interim seam; see [Admission Contract](#admission-contract) |
+| Rate / Budget / BudgetPolicy object model | `quota_policy` singleton + per-user overrides; rewrite of the quota layer |
+| Budget Units (BU) abstraction | USD-denominated throughout |
+| Subject kinds (group, organization, tenant) | User only; group/org resolution removed with the legacy org directory |
+| Soft overage (`over` state, fallback chains, `x-praxis-over-budget`) | Hard enforcement only |
+| Configurable periods, drain/rollover renewal, `deduct_overage` | Calendar month hardwired; no carry-forward |
+| Multi-tenancy (`X-Tenant`, tenant columns, Redis ACLs) | Single implicit tenant |
+| Token budgets via unit-cost rate tables | Not expressible (USD only) |
+
+### Missing capabilities (not in Price Tag at all)
+
+| Capability | Notes |
+|---|---|
+| CloudEvent `id` deduplication | No event-id uniqueness; retried delivery double-charges. Must be added before initial release |
+| Rate version history / priced-at-`event.time` | Cost frozen at ingest, but no versioned rates; late events priced at current rates |
+| `request_id` correlation | Not carried in the event schema |
+| OTEL Collector pipeline + Loki audit copy | Direct filter-to-service HTTP today; no recovery copy, no collector-side retry buffering |
+| Usage query API (`group_by`/`granularity`/filters) and `/usage/me` | Dashboard-oriented report endpoints only |
+| Management REST API (rates, budgets, budget policies CRUD with `X-Tenant`) | No rates or budget-policy HTTP surface at all; budgets are the `safety-net` singleton endpoint; per-user overrides are DB-only. See the endpoint table under [API: REST](#api-rest) |
+| Bring Your Own Metering (`embedded`/`federated`, adapters, overage callbacks) | Entirely new work, post-initial-release |
+| Reconciliation (recompute balances/flags from ledger) | Rollup backfill exists for dashboards; no decision reconciliation |
+| Tenant binding of events (derive tenant from sender identity, reject payload mismatch) | Events trusted as sent |
+| Budget metrics and alert rules | Basic Prometheus counters only; none of the ADR metric set |
+| Pacing | Out of scope in both this ADR and Price Tag |
+
 ## Open Questions
 
 | # | Question | Context |
@@ -1391,6 +1493,8 @@ Redis holds admission flags and balance counters. It does not store configuratio
 ## Implementation notes
 
 We recommend that the Budget Service be implemented in Rust rather than Go. Tokenomics is a critical part of the system: the Budget Service rates, aggregates, and writes admission state for every inference event, so memory footprint and CPU efficiency matter, and Rust avoids garbage-collection pauses on that ingest path. The only component to implement is the Budget Service; Praxis only reads flags. Shipping the admission crate from the same Rust codebase also keeps one implementation of the storage layout, and one set of tests for it, rather than two that could drift.
+
+> **Price Tag compatibility — implementation language.** The initial release is based on the existing Go implementation (see [Relationship to Price Tag](#relationship-to-price-tag-pricetag-metering)); a Rust rewrite is not on the initial-release path. The Rust recommendation stands for the target architecture and becomes relevant when the Redis admission-flag path and its published crate are built: the crate must be consumable by Praxis (Rust), so the flag writer and the crate should share one implementation. Until then, the Go service carries the accounting and the synchronous admission endpoint, and the latency/efficiency argument above is mitigated by Price Tag's decision caches and the append-only ingest path, which the ENMaaS deployment has exercised in production dogfooding.
 
 ## Risks
 
